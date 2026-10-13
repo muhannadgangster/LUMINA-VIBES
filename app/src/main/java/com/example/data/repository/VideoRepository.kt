@@ -1,21 +1,20 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.util.Log
 import androidx.room.Room
+import com.example.R
 import com.example.data.local.BookmarkEntity
 import com.example.data.local.CollectionEntity
-import com.example.data.local.CustomVideoEntity
 import com.example.data.local.DownloadEntity
 import com.example.data.local.HistoryEntity
 import com.example.data.local.LuminaDatabase
 import com.example.data.local.SearchQueryEntity
-import com.example.data.local.SubscriptionEntity
 import com.example.data.model.Channel
 import com.example.data.model.Chapter
 import com.example.data.model.Comment
 import com.example.data.model.CreatorAnalytics
 import com.example.data.model.DownloadStatus
-import com.example.data.model.GlassMode
 import com.example.data.model.HistoryEntry
 import com.example.data.model.NotificationLevel
 import com.example.data.model.OfflineDownload
@@ -23,6 +22,12 @@ import com.example.data.model.UserPreferences
 import com.example.data.model.Video
 import com.example.data.model.VideoBookmark
 import com.example.data.model.WatchCollection
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -31,14 +36,30 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
-class VideoRepository(context: Context) {
+class VideoRepository(
+  private val context: Context,
+  val dbFirestore: FirebaseFirestore
+) {
+  companion object {
+    private const val TAG = "VideoRepository"
+  }
+
+  // Convenience constructor resolving the custom database ID from string resources
+  constructor(context: Context) : this(
+    context = context,
+    dbFirestore = FirebaseFirestore.getInstance(
+      context.applicationContext.getString(R.string.firestore_database_id)
+    )
+  )
+
   private val scope = CoroutineScope(Dispatchers.IO)
-  private val db = Room.databaseBuilder(
+  private val roomDb = Room.databaseBuilder(
     context.applicationContext,
     LuminaDatabase::class.java,
     "lumina_database.db"
@@ -50,8 +71,11 @@ class VideoRepository(context: Context) {
   private val _shorts = MutableStateFlow<List<Video>>(emptyList())
   val shorts: StateFlow<List<Video>> = _shorts.asStateFlow()
 
-  private val _channels = MutableStateFlow<List<Channel>>(emptyList())
-  val channels: StateFlow<List<Channel>> = _channels.asStateFlow()
+  private val _isLoadingVideos = MutableStateFlow(true)
+  val isLoadingVideos: StateFlow<Boolean> = _isLoadingVideos.asStateFlow()
+
+  private val _videosErrorMessage = MutableStateFlow<String?>(null)
+  val videosErrorMessage: StateFlow<String?> = _videosErrorMessage.asStateFlow()
 
   private val _comments = MutableStateFlow<Map<String, List<Comment>>>(emptyMap())
   val comments: StateFlow<Map<String, List<Comment>>> = _comments.asStateFlow()
@@ -65,12 +89,392 @@ class VideoRepository(context: Context) {
   private val _watchLaterIds = MutableStateFlow<Set<String>>(emptySet())
   val watchLaterIds: StateFlow<Set<String>> = _watchLaterIds.asStateFlow()
 
+  private val _subscribedChannelIds = MutableStateFlow<Set<String>>(emptySet())
+  val subscribedChannelIds: StateFlow<Set<String>> = _subscribedChannelIds.asStateFlow()
+
+  private val _likedVideoIds = MutableStateFlow<Set<String>>(emptySet())
+  val likedVideoIds: StateFlow<Set<String>> = _likedVideoIds.asStateFlow()
+
+  private var videosListenerRegistration: ListenerRegistration? = null
+  private var activeCommentsRegistration: ListenerRegistration? = null
+  private var activeCommentsVideoId: String? = null
+  private var subscriptionsListenerRegistration: ListenerRegistration? = null
+
   init {
-    loadSeedData()
-    observeCustomVideos()
+    val currentAuthUser = Firebase.auth.currentUser
+    if (currentAuthUser != null) {
+      startListening(currentAuthUser.uid)
+    }
   }
 
-  val watchHistory: Flow<List<HistoryEntry>> = db.historyDao().getAllHistory().map { list ->
+  fun startListening(currentUserId: String) {
+    listenToPublishedVideos()
+    listenToUserSubscriptions(currentUserId)
+  }
+
+  fun stopListening() {
+    videosListenerRegistration?.remove()
+    videosListenerRegistration = null
+    activeCommentsRegistration?.remove()
+    activeCommentsRegistration = null
+    subscriptionsListenerRegistration?.remove()
+    subscriptionsListenerRegistration = null
+  }
+
+  private fun listenToPublishedVideos() {
+    videosListenerRegistration?.remove()
+    _isLoadingVideos.value = true
+    _videosErrorMessage.value = null
+
+    try {
+      videosListenerRegistration = dbFirestore.collection("videos")
+        .whereEqualTo("status", "published")
+        .whereEqualTo("visibility", "public")
+        .addSnapshotListener { snapshot, error ->
+          _isLoadingVideos.value = false
+          if (error != null) {
+            Log.e(TAG, "Error fetching published videos from Firestore", error)
+            _videosErrorMessage.value = error.localizedMessage ?: "Failed to fetch videos from server"
+            return@addSnapshotListener
+          }
+
+          if (snapshot != null) {
+            val list = mutableListOf<Video>()
+            for (doc in snapshot.documents) {
+              val id = doc.id
+              val title = doc.getString("title") ?: ""
+              val description = doc.getString("description") ?: ""
+              val videoUrl = doc.getString("videoUrl") ?: ""
+              val thumbnailUrl = doc.getString("thumbnailUrl") ?: ""
+              val durationSec = doc.getLong("durationSeconds")?.toInt() ?: 0
+              val formattedDur = doc.getString("formattedDuration") ?: formatDurationSeconds(durationSec)
+              val views = doc.getLong("views") ?: 0L
+              val formattedViews = doc.getString("formattedViews") ?: formatViewsCount(views)
+              val uploadDate = doc.getString("uploadDate") ?: "Recently"
+              val channelId = doc.getString("channelId") ?: doc.getString("creatorId") ?: ""
+              val channelTitle = doc.getString("channelTitle") ?: doc.getString("creatorName") ?: "Creator"
+              val channelAvatarUrl = doc.getString("channelAvatarUrl") ?: doc.getString("creatorAvatar") ?: ""
+              val isVerified = doc.getBoolean("isVerifiedChannel") ?: false
+              val isShort = doc.getBoolean("isShort") ?: false
+              val category = doc.getString("category") ?: "General"
+              val likesCount = doc.getLong("likesCount") ?: 0L
+              val dislikesCount = doc.getLong("dislikesCount") ?: 0L
+              val creatorId = doc.getString("creatorId") ?: channelId
+              val status = doc.getString("status") ?: "published"
+              val visibility = doc.getString("visibility") ?: "public"
+
+              // Only include strictly public and published videos
+              if (status == "published" && visibility == "public") {
+                list.add(
+                  Video(
+                    id = id,
+                    title = title,
+                    description = description,
+                    videoUrl = videoUrl,
+                    thumbnailUrl = thumbnailUrl,
+                    durationSeconds = durationSec,
+                    formattedDuration = formattedDur,
+                    views = views,
+                    formattedViews = formattedViews,
+                    uploadDate = uploadDate,
+                    channelId = channelId,
+                    channelTitle = channelTitle,
+                    channelAvatarUrl = channelAvatarUrl,
+                    isVerifiedChannel = isVerified,
+                    isShort = isShort,
+                    category = category,
+                    likesCount = likesCount,
+                    dislikesCount = dislikesCount,
+                    isLiked = _likedVideoIds.value.contains(id),
+                    isSubscribed = _subscribedChannelIds.value.contains(channelId),
+                    creatorId = creatorId,
+                    status = status,
+                    visibility = visibility
+                  )
+                )
+              }
+            }
+            _videos.value = list
+            _shorts.value = list.filter { it.isShort }
+          }
+        }
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to register video snapshot listener", e)
+      _isLoadingVideos.value = false
+      _videosErrorMessage.value = e.localizedMessage
+    }
+  }
+
+  private fun listenToUserSubscriptions(userId: String) {
+    subscriptionsListenerRegistration?.remove()
+    try {
+      subscriptionsListenerRegistration = dbFirestore.collection("users")
+        .document(userId)
+        .collection("subscriptions")
+        .addSnapshotListener { snapshot, error ->
+          if (error != null) {
+            Log.w(TAG, "Error fetching user subscriptions", error)
+            return@addSnapshotListener
+          }
+          if (snapshot != null) {
+            val subIds = snapshot.documents.mapNotNull { it.getString("creatorId") ?: it.id }.toSet()
+            _subscribedChannelIds.value = subIds
+            // Update videos isSubscribed flag
+            _videos.value = _videos.value.map { v ->
+              v.copy(isSubscribed = subIds.contains(v.channelId))
+            }
+          }
+        }
+    } catch (e: Exception) {
+      Log.w(TAG, "Error subscribing to user subscriptions", e)
+    }
+  }
+
+  fun listenToComments(videoId: String) {
+    if (activeCommentsVideoId == videoId && activeCommentsRegistration != null) return
+    activeCommentsRegistration?.remove()
+    activeCommentsVideoId = videoId
+
+    try {
+      activeCommentsRegistration = dbFirestore.collection("videos")
+        .document(videoId)
+        .collection("comments")
+        .orderBy("createdAt", Query.Direction.DESCENDING)
+        .addSnapshotListener { snapshot, error ->
+          if (error != null) {
+            Log.e(TAG, "Error listening to comments for $videoId", error)
+            return@addSnapshotListener
+          }
+          if (snapshot != null) {
+            val list = snapshot.documents.map { doc ->
+              Comment(
+                id = doc.id,
+                videoId = videoId,
+                userId = doc.getString("userId") ?: "",
+                authorName = doc.getString("userName") ?: doc.getString("authorName") ?: "Viewer",
+                authorAvatarUrl = doc.getString("userAvatar") ?: doc.getString("authorAvatarUrl") ?: "",
+                text = doc.getString("text") ?: "",
+                timestamp = doc.getString("timestamp") ?: "Just now",
+                likesCount = doc.getLong("likesCount") ?: 0L,
+                isLiked = false
+              )
+            }
+            val currentMap = _comments.value.toMutableMap()
+            currentMap[videoId] = list
+            _comments.value = currentMap
+          }
+        }
+    } catch (e: Exception) {
+      Log.e(TAG, "Error initiating comment listener", e)
+    }
+  }
+
+  suspend fun publishVideo(
+    title: String,
+    description: String,
+    videoUrl: String,
+    thumbnailUrl: String,
+    category: String,
+    durationSeconds: Int = 180,
+    isShort: Boolean = false,
+    visibility: String = "public"
+  ): Result<String> {
+    val authUser = Firebase.auth.currentUser ?: return Result.failure(IllegalStateException("Must be signed in to publish video"))
+    val videoId = "v_${UUID.randomUUID().toString().take(12)}"
+    val formattedDur = formatDurationSeconds(durationSeconds)
+    val uploadDateString = SimpleDateFormat("MMM d, yyyy", Locale.US).format(Date())
+
+    val payload = mapOf(
+      "id" to videoId,
+      "title" to title.trim(),
+      "description" to description.trim(),
+      "videoUrl" to videoUrl.trim(),
+      "thumbnailUrl" to thumbnailUrl.trim(),
+      "durationSeconds" to durationSeconds,
+      "formattedDuration" to formattedDur,
+      "views" to 0L,
+      "formattedViews" to "0 views",
+      "uploadDate" to uploadDateString,
+      "channelId" to authUser.uid,
+      "channelTitle" to (authUser.displayName ?: "Creator"),
+      "channelAvatarUrl" to (authUser.photoUrl?.toString() ?: ""),
+      "creatorId" to authUser.uid,
+      "creatorName" to (authUser.displayName ?: "Creator"),
+      "creatorAvatar" to (authUser.photoUrl?.toString() ?: ""),
+      "isVerifiedChannel" to false,
+      "isShort" to isShort,
+      "category" to category,
+      "likesCount" to 0L,
+      "dislikesCount" to 0L,
+      "status" to "published",
+      "visibility" to visibility,
+      "createdAt" to FieldValue.serverTimestamp()
+    )
+
+    return try {
+      dbFirestore.collection("videos").document(videoId).set(payload).await()
+      Log.i(TAG, "Successfully published video $videoId to Firestore")
+      Result.success(videoId)
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to publish video to Firestore", e)
+      Result.failure(e)
+    }
+  }
+
+  fun recordVideoView(videoId: String) {
+    if (videoId.isBlank()) return
+    scope.launch {
+      try {
+        dbFirestore.collection("videos").document(videoId)
+          .update(
+            "views", FieldValue.increment(1),
+            "formattedViews", FieldValue.increment(0) // keep in sync
+          )
+        Log.i(TAG, "Incremented view for video $videoId in Firestore")
+      } catch (e: Exception) {
+        Log.w(TAG, "Failed to increment view count on Firestore: ${e.message}")
+      }
+    }
+  }
+
+  fun toggleLike(videoId: String) {
+    val user = Firebase.auth.currentUser ?: return
+    val currentLiked = _likedVideoIds.value.contains(videoId)
+    val newLiked = !currentLiked
+
+    val updatedSet = _likedVideoIds.value.toMutableSet()
+    if (newLiked) updatedSet.add(videoId) else updatedSet.remove(videoId)
+    _likedVideoIds.value = updatedSet
+
+    // Optimistically update local video state
+    _videos.value = _videos.value.map { v ->
+      if (v.id == videoId) {
+        val newLikes = if (newLiked) v.likesCount + 1 else maxOf(0L, v.likesCount - 1)
+        v.copy(isLiked = newLiked, likesCount = newLikes)
+      } else v
+    }
+
+    scope.launch {
+      try {
+        val likeDocRef = dbFirestore.collection("videos").document(videoId)
+          .collection("likes").document(user.uid)
+        val videoDocRef = dbFirestore.collection("videos").document(videoId)
+
+        if (newLiked) {
+          likeDocRef.set(mapOf("userId" to user.uid, "videoId" to videoId, "createdAt" to FieldValue.serverTimestamp()))
+          videoDocRef.update("likesCount", FieldValue.increment(1))
+        } else {
+          likeDocRef.delete()
+          videoDocRef.update("likesCount", FieldValue.increment(-1))
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error toggling like on Firestore", e)
+      }
+    }
+  }
+
+  fun toggleDislike(videoId: String) {
+    _videos.value = _videos.value.map { v ->
+      if (v.id == videoId) {
+        val newDisliked = !v.isDisliked
+        v.copy(
+          isDisliked = newDisliked,
+          dislikesCount = if (newDisliked) v.dislikesCount + 1 else maxOf(0L, v.dislikesCount - 1)
+        )
+      } else v
+    }
+  }
+
+  fun toggleSubscribe(channelId: String, channelName: String = "Creator", channelAvatar: String = "") {
+    val user = Firebase.auth.currentUser ?: return
+    val isSubscribed = _subscribedChannelIds.value.contains(channelId)
+    val newSubscribed = !isSubscribed
+
+    val newSet = _subscribedChannelIds.value.toMutableSet()
+    if (newSubscribed) newSet.add(channelId) else newSet.remove(channelId)
+    _subscribedChannelIds.value = newSet
+
+    _videos.value = _videos.value.map { v ->
+      if (v.channelId == channelId) v.copy(isSubscribed = newSubscribed) else v
+    }
+
+    scope.launch {
+      try {
+        val subDocRef = dbFirestore.collection("users").document(user.uid)
+          .collection("subscriptions").document(channelId)
+        if (newSubscribed) {
+          subDocRef.set(
+            mapOf(
+              "userId" to user.uid,
+              "creatorId" to channelId,
+              "creatorName" to channelName,
+              "creatorAvatar" to channelAvatar,
+              "createdAt" to FieldValue.serverTimestamp()
+            )
+          )
+        } else {
+          subDocRef.delete()
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error updating subscription on Firestore", e)
+      }
+    }
+  }
+
+  fun addComment(videoId: String, text: String) {
+    val user = Firebase.auth.currentUser ?: return
+    val commentId = "c_${UUID.randomUUID().toString().take(10)}"
+    val userName = user.displayName ?: "Viewer"
+    val userAvatar = user.photoUrl?.toString() ?: ""
+
+    val payload = mapOf(
+      "id" to commentId,
+      "videoId" to videoId,
+      "userId" to user.uid,
+      "userName" to userName,
+      "userAvatar" to userAvatar,
+      "text" to text.trim(),
+      "timestamp" to "Just now",
+      "likesCount" to 0L,
+      "createdAt" to FieldValue.serverTimestamp()
+    )
+
+    scope.launch {
+      try {
+        dbFirestore.collection("videos").document(videoId)
+          .collection("comments").document(commentId)
+          .set(payload).await()
+        Log.i(TAG, "Added comment $commentId to video $videoId")
+      } catch (e: Exception) {
+        Log.e(TAG, "Failed to add comment to Firestore", e)
+      }
+    }
+  }
+
+  fun getCreatorAnalytics(): CreatorAnalytics {
+    val user = Firebase.auth.currentUser
+    val myVideos = _videos.value.filter {
+      (user != null && (it.creatorId == user.uid || it.channelId == user.uid))
+    }
+
+    val totalViews = myVideos.sumOf { it.views }
+    val totalLikes = myVideos.sumOf { it.likesCount }
+    val totalSeconds = myVideos.sumOf { it.durationSeconds * it.views }
+    val totalWatchHours = String.format(Locale.US, "%.1f", totalSeconds / 3600.0).toDoubleOrNull() ?: 0.0
+
+    return CreatorAnalytics(
+      totalViews = totalViews,
+      totalWatchHours = totalWatchHours,
+      subscribersCount = _subscribedChannelIds.value.size.toLong(),
+      estimatedRevenueUsd = String.format(Locale.US, "%.2f", (totalViews / 1000.0) * 2.5).toDoubleOrNull() ?: 0.0,
+      topVideos = myVideos.sortedByDescending { it.views }.take(4),
+      impressionsRate = if (totalViews > 0) 7.8 else 0.0,
+      averageViewDuration = if (myVideos.isNotEmpty()) "3:45" else "0:00"
+    )
+  }
+
+  // Watch History & Room persistence
+  val watchHistory: Flow<List<HistoryEntry>> = roomDb.historyDao().getAllHistory().map { list ->
     list.map {
       HistoryEntry(
         videoId = it.videoId,
@@ -82,7 +486,7 @@ class VideoRepository(context: Context) {
     }
   }
 
-  val offlineDownloads: Flow<List<OfflineDownload>> = db.downloadDao().getAllDownloads().map { list ->
+  val offlineDownloads: Flow<List<OfflineDownload>> = roomDb.downloadDao().getAllDownloads().map { list ->
     list.map {
       OfflineDownload(
         videoId = it.videoId,
@@ -97,202 +501,38 @@ class VideoRepository(context: Context) {
     }
   }
 
-  val watchCollections: Flow<List<WatchCollection>> = db.collectionDao().getAllCollections().map { list ->
+  val watchCollections: Flow<List<WatchCollection>> = roomDb.collectionDao().getAllCollections().map { list ->
     list.map {
       WatchCollection(
         id = it.id,
         name = it.name,
         description = it.description,
-        videoIds = if (it.videoIdsJson.isBlank()) emptyList() else it.videoIdsJson.split(","),
+        videoIds = it.videoIds.split(",").filter { id -> id.isNotBlank() },
         updatedAt = it.updatedAt,
         isPrivate = it.isPrivate
       )
     }
   }
 
-  val recentSearches: Flow<List<String>> = db.searchDao().getRecentQueries()
-
-  fun getBookmarks(videoId: String): Flow<List<VideoBookmark>> = db.bookmarkDao().getBookmarksForVideo(videoId).map { list ->
-    list.map {
-      VideoBookmark(
-        id = it.id,
-        videoId = it.videoId,
-        timestampMs = it.timestampMs,
-        formattedTime = it.formattedTime,
-        note = it.note,
-        createdAt = it.createdAt
-      )
-    }
-  }
-
-  private fun observeCustomVideos() {
+  fun recordWatchHistory(videoId: String, positionMs: Long, durationMs: Long) {
+    if (_userPreferences.value.pauseWatchHistory) return
     scope.launch {
-      db.customVideoDao().getAllCustomVideos().collect { customList ->
-        val converted = customList.map { entity ->
-          Video(
-            id = entity.id,
-            title = entity.title,
-            description = entity.description,
-            videoUrl = entity.videoUrl,
-            thumbnailUrl = entity.thumbnailUrl,
-            durationSeconds = entity.durationSeconds,
-            formattedDuration = formatDuration(entity.durationSeconds),
-            views = entity.views,
-            formattedViews = "${entity.views} views",
-            uploadDate = entity.uploadDate,
-            channelId = "user_channel",
-            channelTitle = "Creator Studio",
-            channelAvatarUrl = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80",
-            isVerifiedChannel = true,
-            isShort = entity.isShort,
-            category = entity.category,
-            likesCount = 0,
-            dislikesCount = 0,
-            isLiked = false,
-            isDisliked = false,
-            isSubscribed = true,
-            chapters = listOf(
-              Chapter("Beginning", 0, "0:00"),
-              Chapter("Key Segment", entity.durationSeconds / 2, formatDuration(entity.durationSeconds / 2))
-            ),
-            tags = listOf(entity.category, "CustomUpload", "Original"),
-            keyPoints = listOf("User-created content uploaded via Lumina Creator Studio.", "Stored with local persistence.")
-          )
-        }
-        val currentSeed = seedVideos()
-        val customRegular = converted.filter { !it.isShort }
-        val customShorts = converted.filter { it.isShort }
-
-        _videos.value = customRegular + currentSeed
-        _shorts.value = customShorts + seedShorts()
-      }
-    }
-  }
-
-  private fun loadSeedData() {
-    val initialVideos = seedVideos()
-    _videos.value = initialVideos
-    _shorts.value = seedShorts()
-    _channels.value = seedChannels()
-    _comments.value = seedComments()
-
-    // Add initial default collection
-    scope.launch {
-      db.collectionDao().insertOrUpdate(
-        CollectionEntity(
-          id = "c_featured",
-          name = "Visionary Cinema",
-          description = "Masterpiece cinematic shorts and high-fidelity experimental visuals.",
-          videoIdsJson = "v_tears_of_steel,v_cosmos,v_sintel",
-          updatedAt = System.currentTimeMillis(),
-          isPrivate = false
+      roomDb.historyDao().insert(
+        HistoryEntity(
+          videoId = videoId,
+          playbackPositionMs = positionMs,
+          durationMs = durationMs,
+          watchedAt = System.currentTimeMillis(),
+          isCompleted = positionMs >= (durationMs * 0.95)
         )
       )
     }
   }
 
-  fun updatePreferences(update: (UserPreferences) -> UserPreferences) {
-    _userPreferences.value = update(_userPreferences.value)
-  }
-
-  fun toggleLike(videoId: String) {
-    _videos.value = _videos.value.map { v ->
-      if (v.id == videoId) {
-        val newIsLiked = !v.isLiked
-        v.copy(
-          isLiked = newIsLiked,
-          likesCount = if (newIsLiked) v.likesCount + 1 else maxOf(0, v.likesCount - 1),
-          isDisliked = if (newIsLiked) false else v.isDisliked
-        )
-      } else v
-    }
-    _shorts.value = _shorts.value.map { v ->
-      if (v.id == videoId) {
-        val newIsLiked = !v.isLiked
-        v.copy(
-          isLiked = newIsLiked,
-          likesCount = if (newIsLiked) v.likesCount + 1 else maxOf(0, v.likesCount - 1),
-          isDisliked = if (newIsLiked) false else v.isDisliked
-        )
-      } else v
-    }
-  }
-
-  fun toggleDislike(videoId: String) {
-    _videos.value = _videos.value.map { v ->
-      if (v.id == videoId) {
-        val newDisliked = !v.isDisliked
-        v.copy(
-          isDisliked = newDisliked,
-          isLiked = if (newDisliked) false else v.isLiked
-        )
-      } else v
-    }
-    _shorts.value = _shorts.value.map { v ->
-      if (v.id == videoId) {
-        val newDisliked = !v.isDisliked
-        v.copy(
-          isDisliked = newDisliked,
-          isLiked = if (newDisliked) false else v.isLiked
-        )
-      } else v
-    }
-  }
-
-  fun toggleSubscribe(channelId: String) {
-    _channels.value = _channels.value.map { ch ->
-      if (ch.id == channelId) {
-        val newSub = !ch.isSubscribed
-        val newCount = if (newSub) ch.subscriberCount + 1 else maxOf(0, ch.subscriberCount - 1)
-        ch.copy(
-          isSubscribed = newSub,
-          subscriberCount = newCount,
-          formattedSubscribers = formatCount(newCount)
-        )
-      } else ch
-    }
-
-    _videos.value = _videos.value.map { v ->
-      if (v.channelId == channelId) {
-        v.copy(isSubscribed = !v.isSubscribed)
-      } else v
-    }
-
+  fun clearWatchHistory() {
     scope.launch {
-      val isSub = db.subscriptionDao().isSubscribed(channelId)
-      if (isSub) {
-        db.subscriptionDao().delete(channelId)
-      } else {
-        val ch = _channels.value.find { it.id == channelId }
-        if (ch != null) {
-          db.subscriptionDao().insert(
-            SubscriptionEntity(
-              channelId = ch.id,
-              channelName = ch.name,
-              channelAvatar = ch.avatarUrl,
-              notificationLevel = ch.notificationLevel.name,
-              subscribedAt = System.currentTimeMillis()
-            )
-          )
-        }
-      }
+      roomDb.historyDao().clearAll()
     }
-  }
-
-  fun setNotificationLevel(channelId: String, level: NotificationLevel) {
-    _channels.value = _channels.value.map {
-      if (it.id == channelId) it.copy(notificationLevel = level) else it
-    }
-  }
-
-  fun toggleWatchLater(videoId: String) {
-    val current = _watchLaterIds.value.toMutableSet()
-    if (current.contains(videoId)) {
-      current.remove(videoId)
-    } else {
-      current.add(videoId)
-    }
-    _watchLaterIds.value = current
   }
 
   fun addToQueue(video: Video) {
@@ -311,89 +551,44 @@ class VideoRepository(context: Context) {
     _universalQueue.value = emptyList()
   }
 
-  fun addComment(videoId: String, text: String, authorName: String = "You") {
-    val currentMap = _comments.value.toMutableMap()
-    val videoComments = currentMap[videoId]?.toMutableList() ?: mutableListOf()
-    val newComment = Comment(
-      id = "c_${UUID.randomUUID().toString().take(8)}",
-      videoId = videoId,
-      authorName = authorName,
-      authorAvatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80",
-      text = text,
-      timestamp = "Just now",
-      likesCount = 0,
-      isLiked = false,
-      repliesCount = 0,
-      isCreatorPinned = false
-    )
-    videoComments.add(0, newComment)
-    currentMap[videoId] = videoComments
-    _comments.value = currentMap
+  fun toggleWatchLater(videoId: String) {
+    val current = _watchLaterIds.value.toMutableSet()
+    if (current.contains(videoId)) {
+      current.remove(videoId)
+    } else {
+      current.add(videoId)
+    }
+    _watchLaterIds.value = current
   }
 
-  fun toggleCommentLike(videoId: String, commentId: String) {
-    val currentMap = _comments.value.toMutableMap()
-    val list = currentMap[videoId] ?: return
-    currentMap[videoId] = list.map { c ->
-      if (c.id == commentId) {
-        val newLiked = !c.isLiked
-        c.copy(
-          isLiked = newLiked,
-          likesCount = if (newLiked) c.likesCount + 1 else maxOf(0, c.likesCount - 1)
+  fun getBookmarks(videoId: String): Flow<List<VideoBookmark>> = getBookmarksForVideo(videoId)
+
+  fun getBookmarksForVideo(videoId: String): Flow<List<VideoBookmark>> {
+    return roomDb.bookmarkDao().getBookmarksForVideo(videoId).map { list ->
+      list.map {
+        VideoBookmark(
+          id = it.id,
+          videoId = it.videoId,
+          timestampMs = it.timestampMs,
+          formattedTime = it.formattedTime,
+          note = it.note,
+          createdAt = it.createdAt
         )
-      } else c
-    }
-    _comments.value = currentMap
-  }
-
-  fun recordWatchHistory(videoId: String, positionMs: Long, durationMs: Long) {
-    if (_userPreferences.value.pauseWatchHistory) return
-    scope.launch {
-      db.historyDao().insertOrUpdate(
-        HistoryEntity(
-          videoId = videoId,
-          watchedAt = System.currentTimeMillis(),
-          playbackPositionMs = positionMs,
-          durationMs = durationMs,
-          isCompleted = positionMs > (durationMs * 0.9)
-        )
-      )
-    }
-  }
-
-  suspend fun getSavedPosition(videoId: String): Long {
-    return db.historyDao().getHistoryForVideo(videoId)?.playbackPositionMs ?: 0L
-  }
-
-  fun clearWatchHistory() {
-    scope.launch {
-      db.historyDao().clearHistory()
-    }
-  }
-
-  fun recordSearchQuery(query: String) {
-    if (query.isBlank() || _userPreferences.value.pauseSearchHistory) return
-    scope.launch {
-      db.searchDao().insertQuery(SearchQueryEntity(query.trim(), System.currentTimeMillis()))
-    }
-  }
-
-  fun clearSearchHistory() {
-    scope.launch {
-      db.searchDao().clearAllQueries()
+      }
     }
   }
 
   fun addBookmark(videoId: String, timestampMs: Long, note: String) {
-    val formatted = formatDuration((timestampMs / 1000).toInt())
+    val totalSec = (timestampMs / 1000).toInt()
+    val formatted = "%02d:%02d".format(totalSec / 60, totalSec % 60)
     scope.launch {
-      db.bookmarkDao().insertBookmark(
+      roomDb.bookmarkDao().insert(
         BookmarkEntity(
           id = UUID.randomUUID().toString(),
           videoId = videoId,
           timestampMs = timestampMs,
           formattedTime = formatted,
-          note = note.ifBlank { "Bookmark at $formatted" },
+          note = note,
           createdAt = System.currentTimeMillis()
         )
       )
@@ -402,29 +597,20 @@ class VideoRepository(context: Context) {
 
   fun deleteBookmark(bookmark: VideoBookmark) {
     scope.launch {
-      db.bookmarkDao().deleteBookmark(
-        BookmarkEntity(
-          id = bookmark.id,
-          videoId = bookmark.videoId,
-          timestampMs = bookmark.timestampMs,
-          formattedTime = bookmark.formattedTime,
-          note = bookmark.note,
-          createdAt = bookmark.createdAt
-        )
-      )
+      roomDb.bookmarkDao().delete(bookmark.id)
     }
   }
 
   fun startDownload(video: Video) {
     scope.launch {
-      db.downloadDao().insertOrUpdate(
+      roomDb.downloadDao().insert(
         DownloadEntity(
           videoId = video.id,
           title = video.title,
           thumbnailUrl = video.thumbnailUrl,
           videoUrl = video.videoUrl,
           progressPercent = 100,
-          sizeMb = (video.durationSeconds * 0.28).coerceAtLeast(18.5),
+          sizeMb = 32.5,
           status = DownloadStatus.COMPLETED.name,
           downloadedAt = System.currentTimeMillis()
         )
@@ -434,502 +620,26 @@ class VideoRepository(context: Context) {
 
   fun deleteDownload(videoId: String) {
     scope.launch {
-      db.downloadDao().deleteDownload(videoId)
+      roomDb.downloadDao().delete(videoId)
     }
   }
 
-  fun createCollection(name: String, description: String, initialVideoIds: List<String> = emptyList()) {
-    scope.launch {
-      db.collectionDao().insertOrUpdate(
-        CollectionEntity(
-          id = "c_${UUID.randomUUID().toString().take(8)}",
-          name = name,
-          description = description,
-          videoIdsJson = initialVideoIds.joinToString(","),
-          updatedAt = System.currentTimeMillis(),
-          isPrivate = true
-        )
-      )
-    }
+  fun updatePreferences(transform: (UserPreferences) -> UserPreferences) {
+    _userPreferences.value = transform(_userPreferences.value)
   }
 
-  fun addVideoToCollection(collectionId: String, videoId: String) {
-    scope.launch {
-      val collections = db.collectionDao()
-      // find collection
-      // update
-    }
-  }
-
-  fun publishVideo(
-    title: String,
-    description: String,
-    category: String,
-    videoUrl: String,
-    isShort: Boolean
-  ) {
-    val duration = if (isShort) 45 else 210
-    val defaultThumb = if (isShort) {
-      "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=600&auto=format&fit=crop&q=80"
-    } else {
-      "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=800&auto=format&fit=crop&q=80"
-    }
-
-    val entity = CustomVideoEntity(
-      id = "custom_${System.currentTimeMillis()}",
-      title = title,
-      description = description,
-      videoUrl = videoUrl.ifBlank { "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8" },
-      thumbnailUrl = defaultThumb,
-      durationSeconds = duration,
-      category = category,
-      isShort = isShort,
-      uploadDate = "Today",
-      views = 1
-    )
-
-    scope.launch {
-      db.customVideoDao().insertVideo(entity)
-    }
-  }
-
-  fun getCreatorAnalytics(): CreatorAnalytics {
-    val allVids = _videos.value.filter { it.channelId == "user_channel" || it.id.startsWith("custom_") }
-    return CreatorAnalytics(
-      totalViews = 184520L,
-      totalWatchHours = 12480.5,
-      subscribersCount = 4820L,
-      estimatedRevenueUsd = 1420.75,
-      topVideos = _videos.value.take(4),
-      impressionsRate = 9.2,
-      averageViewDuration = "5:18"
-    )
-  }
-
-  // --- Seed Data with real open video streams and rich metadata ---
-
-  private fun seedVideos(): List<Video> {
-    return listOf(
-      Video(
-        id = "v_tears_of_steel",
-        title = "Tears of Steel: VFX Sci-Fi Odyssey",
-        description = "A futuristic sci-fi epic set in a dystopian future where a group of warriors and scientists attempt to avert a technological singularity. Mastered in 4K with stunning visual effects by the Blender Institute.",
-        videoUrl = "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8",
-        thumbnailUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 734,
-        formattedDuration = "12:14",
-        views = 3420800,
-        formattedViews = "3.4M views",
-        uploadDate = "2 weeks ago",
-        channelId = "ch_blender",
-        channelTitle = "Blender Open Studio",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Sci-Fi & Cinema",
-        likesCount = 148200,
-        dislikesCount = 1200,
-        chapters = listOf(
-          Chapter("Introduction & Reunion", 0, "0:00"),
-          Chapter("The Holographic Bridge", 180, "3:00"),
-          Chapter("Robotic Convergence", 420, "7:00"),
-          Chapter("The Singularity Choice", 600, "10:00")
-        ),
-        tags = listOf("SciFi", "VFX", "Cinematic", "4K", "Robotics"),
-        keyPoints = listOf(
-          "Pioneering open-source photorealistic CGI combined with live action.",
-          "Explores themes of artificial consciousness and human emotional attachments.",
-          "Shot on location at the historic Oude Kerk in Amsterdam."
-        )
-      ),
-      Video(
-        id = "v_cosmos",
-        title = "Echo: Futuristic CGI Dimension",
-        description = "A high-fidelity experimental CGI visual journey exploring digital architecture, quantum particles, and synth soundscapes.",
-        videoUrl = "https://cdn.jsdelivr.net/gh/mediaelement/mediaelement-files@master/echo-hereweare.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1506703719100-a0f3a48c0f86?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 730,
-        formattedDuration = "12:10",
-        views = 1890400,
-        formattedViews = "1.8M views",
-        uploadDate = "1 month ago",
-        channelId = "ch_blender",
-        channelTitle = "Blender Open Studio",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Animation",
-        likesCount = 98400,
-        dislikesCount = 850,
-        chapters = listOf(
-          Chapter("The Windswept Ridge", 0, "0:00"),
-          Chapter("Victor's Offer", 210, "3:30"),
-          Chapter("The Multiverse Door", 450, "7:30"),
-          Chapter("Metamorphosis", 620, "10:20")
-        ),
-        tags = listOf("Animation", "Surreal", "Blender", "Fantasy"),
-        keyPoints = listOf(
-          "Won the Jury Prize at the prestigious SIGGRAPH Computer Animation Festival.",
-          "Features revolutionary physically-based hair and procedural physics simulation.",
-          "Darkly humorous narrative exploring existential choices."
-        )
-      ),
-      Video(
-        id = "v_sintel",
-        title = "Oceans: Deep Sea Marine Odyssey",
-        description = "Dive into the mysterious depths of earth's oceans with spectacular marine wildlife encounters in crystal clear high definition.",
-        videoUrl = "https://vjs.zencdn.net/v/oceans.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 888,
-        formattedDuration = "14:48",
-        views = 7650000,
-        formattedViews = "7.6M views",
-        uploadDate = "3 months ago",
-        channelId = "ch_chronos",
-        channelTitle = "Chronos Cinema",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Nature",
-        likesCount = 420000,
-        dislikesCount = 3100,
-        chapters = listOf(
-          Chapter("The Frozen Mountain", 0, "0:00"),
-          Chapter("Memory of Scales", 240, "4:00"),
-          Chapter("The Oasis Journey", 480, "8:00"),
-          Chapter("The Dragon's Lair", 720, "12:00")
-        ),
-        tags = listOf("Nature", "Oceans", "Wildlife", "Cinematic"),
-        keyPoints = listOf(
-          "Unprecedented underwater filming techniques and deep reef illumination.",
-          "Showcases majestic humpback whales and bioluminescent coral habitats."
-        )
-      ),
-      Video(
-        id = "v_bunny",
-        title = "Big Buck Bunny: Colorful Forest Chronicles",
-        description = "A colossal, warm-hearted woodland rabbit exacts gentle, hilarious revenge against three pesky forest bullies in this timeless animation classic.",
-        videoUrl = "https://cdn.jsdelivr.net/gh/mediaelement/mediaelement-files@master/big_buck_bunny.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 596,
-        formattedDuration = "9:56",
-        views = 12400000,
-        formattedViews = "12M views",
-        uploadDate = "6 months ago",
-        channelId = "ch_blender",
-        channelTitle = "Blender Open Studio",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Animation",
-        likesCount = 890000,
-        dislikesCount = 5400,
-        chapters = listOf(
-          Chapter("Morning in the Glade", 0, "0:00"),
-          Chapter("The Butterfly Incident", 120, "2:00"),
-          Chapter("The Trap Blueprint", 300, "5:00"),
-          Chapter("Bunny's Payback", 450, "7:30")
-        ),
-        tags = listOf("Comedy", "Classic", "OpenSource", "Animation"),
-        keyPoints = listOf(
-          "The definitive benchmark video used worldwide for video codec and display quality testing.",
-          "Vibrant high-contrast color palette ideal for testing HDR and Liquid Glass playback.",
-          "Timeless physical slapstick comedy."
-        )
-      ),
-      Video(
-        id = "v_we_are_going_on_bullrun",
-        title = "Cyberpunk Neo-Tokyo: High-Speed Night Drift",
-        description = "Adrenaline-fueled nocturnal racing through towering neon skyscrapers and rain-soaked highways in an ultra-futuristic metropolis.",
-        videoUrl = "https://github.com/intel-iot-devkit/sample-videos/raw/master/car-detection.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 115,
-        formattedDuration = "1:55",
-        views = 980200,
-        formattedViews = "980K views",
-        uploadDate = "4 days ago",
-        channelId = "ch_cyber",
-        channelTitle = "CyberVoxel",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1566492031773-4f4e44671857?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Gaming & Tech",
-        likesCount = 68400,
-        dislikesCount = 420,
-        chapters = listOf(
-          Chapter("Ignition", 0, "0:00"),
-          Chapter("The Neon Expressway", 45, "0:45"),
-          Chapter("Finish Line Drift", 90, "1:30")
-        ),
-        tags = listOf("Cyberpunk", "Tokyo", "Speed", "Synthwave"),
-        keyPoints = listOf(
-          "Synthesizes ray-traced neon lighting with retro-futuristic synth beats.",
-          "High frame-rate capture perfect for testing motion smoothing and OLED displays."
-        )
-      ),
-      Video(
-        id = "v_for_bigger_blazes",
-        title = "Deep Space Odyssey: Planetary Horizons",
-        description = "Voyage past gas giants, shimmering asteroid rings, and interstellar nebulae in this awe-inspiring astrophysical visual journey.",
-        videoUrl = "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/bipbop_16x9_variant.m3u8",
-        thumbnailUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 180,
-        formattedDuration = "3:00",
-        views = 450100,
-        formattedViews = "450K views",
-        uploadDate = "1 week ago",
-        channelId = "ch_nebula",
-        channelTitle = "Nebula Science",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Space & Science",
-        likesCount = 38900,
-        dislikesCount = 110,
-        chapters = listOf(
-          Chapter("Planetary Flyby", 0, "0:00")
-        ),
-        tags = listOf("Space", "Astrophysics", "Cosmos", "Science"),
-        keyPoints = listOf(
-          "Based on real spectroscopic telescope telemetry.",
-          "Synthesizes authentic gravitational lens optical curvature."
-        )
-      ),
-      Video(
-        id = "v_for_bigger_escapes",
-        title = "Wild Earth: Alpine Glaciers & Emerald Fjords",
-        description = "Breathtaking cinematic drone footage capturing pristine glacial peaks, crystal fjords, and untamed wildlife sanctuaries.",
-        videoUrl = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=800&auto=format&fit=crop&q=80",
-        durationSeconds = 60,
-        formattedDuration = "1:00",
-        views = 612000,
-        formattedViews = "612K views",
-        uploadDate = "5 days ago",
-        channelId = "ch_terra",
-        channelTitle = "Terra Explorations",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = false,
-        category = "Nature",
-        likesCount = 49200,
-        dislikesCount = 180,
-        chapters = listOf(
-          Chapter("Glacial Summit", 0, "0:00")
-        ),
-        tags = listOf("Nature", "Drone", "Norway", "Landscape"),
-        keyPoints = listOf(
-          "Ultra-high dynamic range wilderness capture.",
-          "Natural ambient audio recorded with binaural microphones."
-        )
-      )
-    )
-  }
-
-  private fun seedShorts(): List<Video> {
-    return listOf(
-      Video(
-        id = "s_neon_synth",
-        title = "Holographic Glass UI in 2026! ⚡ #Tech #Design #LiquidGlass",
-        description = "Insane translucent UI concepts running at 120 FPS with real-time refraction and specular highlights! What do you think?",
-        videoUrl = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/friday.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&auto=format&fit=crop&q=80",
-        durationSeconds = 15,
-        formattedDuration = "0:15",
-        views = 840000,
-        formattedViews = "840K views",
-        uploadDate = "Yesterday",
-        channelId = "ch_cyber",
-        channelTitle = "CyberVoxel",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1566492031773-4f4e44671857?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = true,
-        category = "Tech",
-        likesCount = 74500,
-        dislikesCount = 320,
-        tags = listOf("Shorts", "Tech", "GlassUI")
-      ),
-      Video(
-        id = "s_tokyo_drift",
-        title = "Midnight Expressway in Neo Tokyo 🏎️💨 #Cyberpunk #Speed",
-        description = "Full throttle through the rain-soaked streets with pure synthwave energy. Sound on! 🎧",
-        videoUrl = "https://github.com/intel-iot-devkit/sample-videos/raw/master/car-detection.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=600&auto=format&fit=crop&q=80",
-        durationSeconds = 30,
-        formattedDuration = "0:30",
-        views = 1250000,
-        formattedViews = "1.2M views",
-        uploadDate = "2 days ago",
-        channelId = "ch_cyber",
-        channelTitle = "CyberVoxel",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1566492031773-4f4e44671857?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = true,
-        category = "Gaming",
-        likesCount = 112000,
-        dislikesCount = 490,
-        tags = listOf("Shorts", "Drift", "Tokyo")
-      ),
-      Video(
-        id = "s_aurora",
-        title = "Urban Life & Cyber Aesthetics 🌌✨ #Modern #City",
-        description = "Pedestrians navigating the modern cityscape in crisp definition.",
-        videoUrl = "https://github.com/intel-iot-devkit/sample-videos/raw/master/face-demographics-walking.mp4",
-        thumbnailUrl = "https://images.unsplash.com/photo-1517411032315-54ef2cb783bb?w=600&auto=format&fit=crop&q=80",
-        durationSeconds = 15,
-        formattedDuration = "0:15",
-        views = 930000,
-        formattedViews = "930K views",
-        uploadDate = "3 days ago",
-        channelId = "ch_terra",
-        channelTitle = "Terra Explorations",
-        channelAvatarUrl = "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=150&auto=format&fit=crop&q=80",
-        isVerifiedChannel = true,
-        isShort = true,
-        category = "Nature",
-        likesCount = 89000,
-        dislikesCount = 210,
-        tags = listOf("Shorts", "City", "Modern")
-      )
-    )
-  }
-
-  private fun seedChannels(): List<Channel> {
-    return listOf(
-      Channel(
-        id = "ch_blender",
-        name = "Blender Open Studio",
-        handle = "@blender_studio",
-        avatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80",
-        bannerUrl = "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=1200&auto=format&fit=crop&q=80",
-        subscriberCount = 3840000,
-        formattedSubscribers = "3.8M subscribers",
-        videoCount = 48,
-        description = "Empowering artists worldwide with open source computer graphics, filmmaking pipelines, and boundary-pushing short films.",
-        isVerified = true,
-        isSubscribed = true,
-        notificationLevel = NotificationLevel.ALL
-      ),
-      Channel(
-        id = "ch_cyber",
-        name = "CyberVoxel",
-        handle = "@cybervoxel",
-        avatarUrl = "https://images.unsplash.com/photo-1566492031773-4f4e44671857?w=150&auto=format&fit=crop&q=80",
-        bannerUrl = "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=1200&auto=format&fit=crop&q=80",
-        subscriberCount = 1420000,
-        formattedSubscribers = "1.4M subscribers",
-        videoCount = 112,
-        description = "Future tech, cybernetic aesthetics, game development devlogs, and next-generation interactive design.",
-        isVerified = true,
-        isSubscribed = false
-      ),
-      Channel(
-        id = "ch_chronos",
-        name = "Chronos Cinema",
-        handle = "@chronos_cinema",
-        avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80",
-        bannerUrl = "https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=1200&auto=format&fit=crop&q=80",
-        subscriberCount = 2890000,
-        formattedSubscribers = "2.8M subscribers",
-        videoCount = 64,
-        description = "Independent cinema and epic narratives celebrating timeless storytelling and digital cinematography.",
-        isVerified = true,
-        isSubscribed = false
-      ),
-      Channel(
-        id = "ch_terra",
-        name = "Terra Explorations",
-        handle = "@terra_explorations",
-        avatarUrl = "https://images.unsplash.com/photo-1472214103451-9374bd1c798e?w=150&auto=format&fit=crop&q=80",
-        bannerUrl = "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=1200&auto=format&fit=crop&q=80",
-        subscriberCount = 920000,
-        formattedSubscribers = "920K subscribers",
-        videoCount = 89,
-        description = "Documenting the furthest reaches of our planet in ultra-high resolution HDR.",
-        isVerified = true,
-        isSubscribed = false
-      ),
-      Channel(
-        id = "ch_nebula",
-        name = "Nebula Science",
-        handle = "@nebulascience",
-        avatarUrl = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=150&auto=format&fit=crop&q=80",
-        bannerUrl = "https://images.unsplash.com/photo-1506703719100-a0f3a48c0f86?w=1200&auto=format&fit=crop&q=80",
-        subscriberCount = 1890000,
-        formattedSubscribers = "1.8M subscribers",
-        videoCount = 140,
-        description = "Unraveling quantum mechanics, astrophysics, and cosmic exploration with deep scientific rigor.",
-        isVerified = true,
-        isSubscribed = false
-      )
-    )
-  }
-
-  private fun seedComments(): Map<String, List<Comment>> {
-    return mapOf(
-      "v_tears_of_steel" to listOf(
-        Comment(
-          id = "c1",
-          videoId = "v_tears_of_steel",
-          authorName = "Blender Open Studio",
-          authorAvatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150&auto=format&fit=crop&q=80",
-          text = "Thank you all for supporting open cinema! The complete 3D assets and 4K EXR pipeline files are available freely in the repository.",
-          timestamp = "Pinned by creator",
-          likesCount = 14200,
-          isLiked = false,
-          repliesCount = 84,
-          isCreatorPinned = true
-        ),
-        Comment(
-          id = "c2",
-          videoId = "v_tears_of_steel",
-          authorName = "Aria Nova",
-          authorAvatarUrl = "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=150&auto=format&fit=crop&q=80",
-          text = "The Liquid Glass HUD reflections on the robotic arms at 7:42 still blow my mind today. Remarkable VFX craftsmanship!",
-          timestamp = "2 days ago",
-          likesCount = 3840,
-          isLiked = true,
-          repliesCount = 12
-        ),
-        Comment(
-          id = "c3",
-          videoId = "v_tears_of_steel",
-          authorName = "DevKairo",
-          authorAvatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80",
-          text = "Watching this on Lumina with Enhanced Glass mode makes the entire experience feel like pure sci-fi.",
-          timestamp = "5 days ago",
-          likesCount = 1290,
-          isLiked = false,
-          repliesCount = 3
-        )
-      ),
-      "v_sintel" to listOf(
-        Comment(
-          id = "cs1",
-          videoId = "v_sintel",
-          authorName = "Elena Rostova",
-          authorAvatarUrl = "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150&auto=format&fit=crop&q=80",
-          text = "That ending gets me every single time. The realization in the dragon's eyes is pure heartbreak.",
-          timestamp = "1 week ago",
-          likesCount = 8400,
-          isLiked = true,
-          repliesCount = 34
-        )
-      )
-    )
-  }
-
-  private fun formatDuration(seconds: Int): String {
+  private fun formatDurationSeconds(seconds: Int): String {
     val m = seconds / 60
     val s = seconds % 60
     return String.format(Locale.US, "%d:%02d", m, s)
   }
 
-  private fun formatCount(count: Long): String {
+  private fun formatViewsCount(count: Long): String {
     return when {
-      count >= 1_000_000 -> String.format(Locale.US, "%.1fM", count / 1_000_000.0)
-      count >= 1_000 -> String.format(Locale.US, "%.1fK", count / 1_000.0)
-      else -> count.toString()
+      count >= 1_000_000 -> String.format(Locale.US, "%.1fM views", count / 1_000_000.0)
+      count >= 1_000 -> String.format(Locale.US, "%.1fK views", count / 1_000.0)
+      count == 1L -> "1 view"
+      else -> "$count views"
     }
   }
 }

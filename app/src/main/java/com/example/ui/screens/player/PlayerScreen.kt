@@ -136,13 +136,22 @@ fun PlayerScreen(
   val state by playerManager.state.collectAsState()
   val currentVideo = state.currentVideo ?: return
   val allVideos by repository.videos.collectAsState()
+  val isLoadingVideos by repository.isLoadingVideos.collectAsState()
   val commentsMap by repository.comments.collectAsState()
   val videoComments = commentsMap[currentVideo.id] ?: emptyList()
   val bookmarks by repository.getBookmarks(currentVideo.id).collectAsState(initial = emptyList())
   val universalQueue by repository.universalQueue.collectAsState()
 
+  val relatedVideos = remember(allVideos, currentVideo.id) {
+    allVideos.filter { it.id != currentVideo.id }
+  }
+
+  LaunchedEffect(currentVideo.id) {
+    repository.listenToComments(currentVideo.id)
+  }
+
   var controlsVisible by remember { mutableStateOf(true) }
-  var selectedTab by remember { mutableIntStateOf(0) } // 0: Companion, 1: Queue, 2: Comments
+  var selectedTab by remember { mutableIntStateOf(0) } // 0: Related & Up Next, 1: Comments, 2: Companion, 3: Queue
 
   // Auto-hide controls after 4 seconds
   LaunchedEffect(controlsVisible, state.isPlaying) {
@@ -693,7 +702,7 @@ fun PlayerScreen(
             }
           }
 
-          // Feature Tabs Row: 1. Smart Watch Companion, 2. Universal Queue, 3. Comments
+          // Feature Tabs Row: 0. Related & Up Next, 1. Comments, 2. Companion, 3. Queue
           item {
             TabRow(
               selectedTabIndex = selectedTab,
@@ -711,150 +720,290 @@ fun PlayerScreen(
                 selected = selectedTab == 0,
                 onClick = { selectedTab = 0 },
                 text = {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Companion", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                  }
+                  Text("Related (${relatedVideos.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
               )
               Tab(
                 selected = selectedTab == 1,
                 onClick = { selectedTab = 1 },
                 text = {
-                  Text("Queue (${universalQueue.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                  Text("Comments (${videoComments.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
               )
               Tab(
                 selected = selectedTab == 2,
                 onClick = { selectedTab = 2 },
                 text = {
-                  Text("Comments (${videoComments.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(13.dp))
+                    Spacer(modifier = Modifier.width(3.dp))
+                    Text("Companion", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                  }
+                }
+              )
+              Tab(
+                selected = selectedTab == 3,
+                onClick = { selectedTab = 3 },
+                text = {
+                  Text("Queue (${universalQueue.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
               )
             }
           }
 
-          // TAB 0: SMART WATCH COMPANION (Chapters, AI Notes, Bookmarks)
+          // TAB 0: RELATED VIDEOS & UP NEXT (Primary Default Tab)
           if (selectedTab == 0) {
-            item {
-              SmartWatchCompanionPanel(
-                video = currentVideo,
-                bookmarks = bookmarks,
-                onSeekTo = { seconds ->
-                  playerManager.seekTo(seconds * 1000L)
-                },
-                onAddBookmark = { note ->
-                  repository.addBookmark(currentVideo.id, state.currentPositionMs, note)
-                },
-                onDeleteBookmark = { b ->
-                  repository.deleteBookmark(b)
+            if (isLoadingVideos && allVideos.isEmpty()) {
+              item {
+                Box(
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(32.dp),
+                  contentAlignment = Alignment.Center
+                ) {
+                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = LuminaCyan, modifier = Modifier.size(36.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("Fetching related content from Firebase...", color = Color.Gray, fontSize = 13.sp)
+                  }
                 }
-              )
-            }
-          }
-
-          // TAB 1: UNIVERSAL QUEUE & UP NEXT
-          if (selectedTab == 1) {
-            item {
-              Column(modifier = Modifier.padding(vertical = 10.dp)) {
-                if (universalQueue.isNotEmpty()) {
-                  Text(
-                    text = "Upcoming in Queue",
-                    style = MaterialTheme.typography.titleSmall.copy(
-                      fontWeight = FontWeight.Bold,
-                      color = Color.White
-                    ),
-                    modifier = Modifier.padding(bottom = 6.dp)
-                  )
-
-                  universalQueue.forEach { qVideo ->
-                    Row(
-                      modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .liquidGlassSurface(shape = RoundedCornerShape(12.dp), elevation = 2.dp)
-                        .clickable { onPlayNextVideo(qVideo) }
-                        .padding(8.dp),
-                      verticalAlignment = Alignment.CenterVertically
-                    ) {
-                      AsyncImage(
-                        model = qVideo.thumbnailUrl,
-                        contentDescription = null,
-                        modifier = Modifier
-                          .size(60.dp, 36.dp)
-                          .clip(RoundedCornerShape(6.dp)),
-                        contentScale = ContentScale.Crop
+              }
+            } else if (relatedVideos.isEmpty()) {
+              item {
+                GlassCard(
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 16.dp),
+                  shape = RoundedCornerShape(16.dp),
+                  elevation = 2.dp
+                ) {
+                  Column(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                    Icon(
+                      imageVector = Icons.Default.PlayArrow,
+                      contentDescription = null,
+                      tint = LuminaCyan,
+                      modifier = Modifier.size(36.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                      text = "No publisher yet publish video",
+                      style = MaterialTheme.typography.titleSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                      ),
+                      modifier = Modifier.testTag("related_videos_empty_text")
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                      text = "Be the first to publish a new video or short from Creator Studio!",
+                      style = MaterialTheme.typography.bodySmall.copy(
+                        color = Color(0xFF94A3B8),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
                       )
-
-                      Spacer(modifier = Modifier.width(8.dp))
-
-                      Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                          text = qVideo.title,
-                          style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                          maxLines = 1,
-                          overflow = TextOverflow.Ellipsis
+                    )
+                  }
+                }
+              }
+            } else {
+              // UP NEXT FEATURED VIDEO
+              val upNextVideo = relatedVideos.first()
+              item {
+                Column(modifier = Modifier.padding(top = 10.dp, bottom = 14.dp)) {
+                  Row(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                  ) {
+                    Text(
+                      text = "Up Next",
+                      style = MaterialTheme.typography.titleSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        fontSize = 15.sp
+                      )
+                    )
+                    Box(
+                      modifier = Modifier
+                        .background(
+                          Brush.horizontalGradient(listOf(LuminaCyan, LuminaViolet)),
+                          shape = RoundedCornerShape(10.dp)
                         )
-                        Text(
-                          text = qVideo.channelTitle,
-                          style = MaterialTheme.typography.labelSmall.copy(
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                      Text(
+                        text = "AUTOPLAY ON",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                          color = Color(0xFF070A11),
+                          fontWeight = FontWeight.ExtraBold,
+                          fontSize = 9.sp
+                        )
+                      )
+                    }
+                  }
+
+                  // Up next card
+                  GlassCard(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .clickable { onPlayNextVideo(upNextVideo) }
+                      .testTag("up_next_card"),
+                    shape = RoundedCornerShape(16.dp),
+                    elevation = 4.dp
+                  ) {
+                    Column {
+                      Box(
+                        modifier = Modifier
+                          .fillMaxWidth()
+                          .height(160.dp)
+                      ) {
+                        AsyncImage(
+                          model = upNextVideo.thumbnailUrl.ifBlank { "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&auto=format&fit=crop&q=80" },
+                          contentDescription = upNextVideo.title,
+                          modifier = Modifier.fillMaxSize(),
+                          contentScale = ContentScale.Crop
+                        )
+                        // Duration Pill
+                        Box(
+                          modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(8.dp)
+                            .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                          Text(
+                            text = upNextVideo.formattedDuration,
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
                           )
-                        )
+                        }
                       }
 
-                      IconButton(
-                        onClick = { repository.removeFromQueue(qVideo.id) },
-                        modifier = Modifier.size(28.dp)
+                      Row(
+                        modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
                       ) {
-                        Icon(Icons.Default.Close, contentDescription = "Remove", tint = Color.White)
+                        AsyncImage(
+                          model = upNextVideo.channelAvatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80" },
+                          contentDescription = null,
+                          modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape),
+                          contentScale = ContentScale.Crop
+                        )
+
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                          Text(
+                            text = upNextVideo.title,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                              fontWeight = FontWeight.Bold,
+                              color = Color.White
+                            ),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                          )
+                          Spacer(modifier = Modifier.height(2.dp))
+                          Text(
+                            text = "${upNextVideo.channelTitle} • ${upNextVideo.formattedViews} • ${upNextVideo.uploadDate}",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                              color = Color(0xFF94A3B8),
+                              fontSize = 11.sp
+                            )
+                          )
+                        }
                       }
                     }
                   }
                 }
+              }
 
-                Spacer(modifier = Modifier.height(10.dp))
+              // REMAINING RELATED VIDEOS LIST
+              if (relatedVideos.size > 1) {
+                item {
+                  Text(
+                    text = "Related Videos (${relatedVideos.size - 1})",
+                    style = MaterialTheme.typography.titleSmall.copy(
+                      fontWeight = FontWeight.Bold,
+                      color = Color.White
+                    ),
+                    modifier = Modifier.padding(top = 8.dp, bottom = 8.dp)
+                  )
+                }
 
-                Text(
-                  text = "Recommended Next",
-                  style = MaterialTheme.typography.titleSmall.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                  ),
-                  modifier = Modifier.padding(bottom = 6.dp)
-                )
-
-                allVideos.filter { it.id != currentVideo.id }.take(5).forEach { nextVid ->
+                items(relatedVideos.drop(1)) { relVideo ->
                   Row(
                     modifier = Modifier
                       .fillMaxWidth()
                       .padding(vertical = 6.dp)
-                      .clickable { onPlayNextVideo(nextVid) },
+                      .liquidGlassSurface(shape = RoundedCornerShape(12.dp), elevation = 2.dp)
+                      .clickable { onPlayNextVideo(relVideo) }
+                      .padding(8.dp)
+                      .testTag("related_video_item_${relVideo.id}"),
                     verticalAlignment = Alignment.CenterVertically
                   ) {
-                    AsyncImage(
-                      model = nextVid.thumbnailUrl,
-                      contentDescription = null,
+                    Box(
                       modifier = Modifier
-                        .size(100.dp, 60.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                      contentScale = ContentScale.Crop
-                    )
+                        .size(110.dp, 68.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                    ) {
+                      AsyncImage(
+                        model = relVideo.thumbnailUrl.ifBlank { "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&auto=format&fit=crop&q=80" },
+                        contentDescription = relVideo.title,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                      )
+                      Box(
+                        modifier = Modifier
+                          .align(Alignment.BottomEnd)
+                          .padding(4.dp)
+                          .background(Color(0xCC000000), RoundedCornerShape(3.dp))
+                          .padding(horizontal = 4.dp, vertical = 1.dp)
+                      ) {
+                        Text(
+                          text = relVideo.formattedDuration,
+                          color = Color.White,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.Bold
+                        )
+                      }
+                    }
 
                     Spacer(modifier = Modifier.width(10.dp))
 
                     Column(modifier = Modifier.weight(1f)) {
                       Text(
-                        text = nextVid.title,
-                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        text = relVideo.title,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                          fontWeight = FontWeight.Bold,
+                          color = Color.White
+                        ),
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                       )
+                      Spacer(modifier = Modifier.height(2.dp))
                       Text(
-                        text = "${nextVid.channelTitle} • ${nextVid.formattedViews}",
+                        text = relVideo.channelTitle,
                         style = MaterialTheme.typography.labelSmall.copy(
-                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                          color = LuminaCyan,
+                          fontWeight = FontWeight.Medium
+                        )
+                      )
+                      Text(
+                        text = "${relVideo.formattedViews} • ${relVideo.uploadDate}",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                          color = Color(0xFF94A3B8),
+                          fontSize = 10.sp
                         )
                       )
                     }
@@ -864,8 +1013,8 @@ fun PlayerScreen(
             }
           }
 
-          // TAB 2: COMMENTS
-          if (selectedTab == 2) {
+          // TAB 1: COMMENTS
+          if (selectedTab == 1) {
             item {
               var newCommentText by remember { mutableStateOf("") }
               Column(modifier = Modifier.padding(vertical = 10.dp)) {
@@ -911,64 +1060,183 @@ fun PlayerScreen(
                   }
                 }
 
-                // Comments list
-                videoComments.forEach { comment ->
-                  Row(
+                if (videoComments.isEmpty()) {
+                  Box(
                     modifier = Modifier
                       .fillMaxWidth()
-                      .padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.Top
+                      .padding(24.dp),
+                    contentAlignment = Alignment.Center
                   ) {
-                    AsyncImage(
-                      model = comment.authorAvatarUrl,
-                      contentDescription = null,
-                      modifier = Modifier
-                        .size(34.dp)
-                        .clip(CircleShape),
-                      contentScale = ContentScale.Crop
+                    Text(
+                      text = "No comments yet. Be the first to share your thoughts!",
+                      style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
                     )
+                  }
+                } else {
+                  // Comments list
+                  videoComments.forEach { comment ->
+                    Row(
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                      verticalAlignment = Alignment.Top
+                    ) {
+                      AsyncImage(
+                        model = comment.authorAvatarUrl.ifBlank { "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80" },
+                        contentDescription = null,
+                        modifier = Modifier
+                          .size(34.dp)
+                          .clip(CircleShape),
+                        contentScale = ContentScale.Crop
+                      )
 
-                    Spacer(modifier = Modifier.width(10.dp))
+                      Spacer(modifier = Modifier.width(10.dp))
 
-                    Column(modifier = Modifier.weight(1f)) {
-                      Row(verticalAlignment = Alignment.CenterVertically) {
+                      Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                            text = comment.authorName,
+                            style = MaterialTheme.typography.labelMedium.copy(
+                              fontWeight = FontWeight.Bold,
+                              color = Color.White
+                            )
+                          )
+                          Spacer(modifier = Modifier.width(6.dp))
+                          Text(
+                            text = comment.timestamp,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                          )
+                        }
+
+                        Spacer(modifier = Modifier.height(2.dp))
+
                         Text(
-                          text = comment.authorName,
-                          style = MaterialTheme.typography.labelMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                          text = comment.text,
+                          style = MaterialTheme.typography.bodySmall.copy(
+                            color = Color(0xFFE2E8F0)
                           )
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                      }
+
+                      IconButton(
+                        onClick = { repository.toggleLike(currentVideo.id) },
+                        modifier = Modifier.size(28.dp)
+                      ) {
+                        Icon(
+                          imageVector = if (comment.isLiked) Icons.Filled.ThumbUp else Icons.Outlined.ThumbUp,
+                          contentDescription = "Like",
+                          tint = if (comment.isLiked) LuminaCyan else Color.White,
+                          modifier = Modifier.size(14.dp)
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // TAB 2: SMART WATCH COMPANION (Chapters, AI Notes, Bookmarks)
+          if (selectedTab == 2) {
+            item {
+              SmartWatchCompanionPanel(
+                video = currentVideo,
+                bookmarks = bookmarks,
+                onSeekTo = { seconds ->
+                  playerManager.seekTo(seconds * 1000L)
+                },
+                onAddBookmark = { note ->
+                  repository.addBookmark(currentVideo.id, state.currentPositionMs, note)
+                },
+                onDeleteBookmark = { b ->
+                  repository.deleteBookmark(b)
+                }
+              )
+            }
+          }
+
+          // TAB 3: UNIVERSAL QUEUE
+          if (selectedTab == 3) {
+            item {
+              Column(modifier = Modifier.padding(vertical = 10.dp)) {
+                if (universalQueue.isNotEmpty()) {
+                  Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                  ) {
+                    Text(
+                      text = "Universal Queue (${universalQueue.size})",
+                      style = MaterialTheme.typography.titleSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                      )
+                    )
+                    Text(
+                      text = "Clear Queue",
+                      style = MaterialTheme.typography.labelSmall.copy(color = LuminaPink),
+                      modifier = Modifier.clickable { repository.clearQueue() }
+                    )
+                  }
+
+                  universalQueue.forEach { qVideo ->
+                    Row(
+                      modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .liquidGlassSurface(shape = RoundedCornerShape(12.dp), elevation = 2.dp)
+                        .clickable { onPlayNextVideo(qVideo) }
+                        .padding(8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                    ) {
+                      AsyncImage(
+                        model = qVideo.thumbnailUrl,
+                        contentDescription = null,
+                        modifier = Modifier
+                          .size(60.dp, 36.dp)
+                          .clip(RoundedCornerShape(6.dp)),
+                        contentScale = ContentScale.Crop
+                      )
+
+                      Spacer(modifier = Modifier.width(8.dp))
+
+                      Column(modifier = Modifier.weight(1f)) {
                         Text(
-                          text = comment.timestamp,
+                          text = qVideo.title,
+                          style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                          text = qVideo.channelTitle,
                           style = MaterialTheme.typography.labelSmall.copy(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                           )
                         )
                       }
 
-                      Spacer(modifier = Modifier.height(2.dp))
-
-                      Text(
-                        text = comment.text,
-                        style = MaterialTheme.typography.bodySmall.copy(
-                          color = Color(0xFFE2E8F0)
-                        )
-                      )
+                      IconButton(
+                        onClick = { repository.removeFromQueue(qVideo.id) },
+                        modifier = Modifier.size(28.dp)
+                      ) {
+                        Icon(Icons.Default.Close, contentDescription = "Remove", tint = Color.White)
+                      }
                     }
-
-                    IconButton(
-                      onClick = { repository.toggleCommentLike(currentVideo.id, comment.id) },
-                      modifier = Modifier.size(28.dp)
-                    ) {
-                      Icon(
-                        imageVector = if (comment.isLiked) Icons.Filled.ThumbUp else Icons.Outlined.ThumbUp,
-                        contentDescription = "Like",
-                        tint = if (comment.isLiked) LuminaCyan else Color.White,
-                        modifier = Modifier.size(14.dp)
-                      )
-                    }
+                  }
+                } else {
+                  Box(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                  ) {
+                    Text(
+                      text = "Queue is empty. Tap 'Queue' on any video to add it here.",
+                      color = Color.Gray,
+                      fontSize = 12.sp
+                    )
                   }
                 }
               }

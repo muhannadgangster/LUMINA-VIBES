@@ -110,8 +110,19 @@ fun ShortsScreen(
   val shorts by repository.shorts.collectAsState()
 
   if (shorts.isEmpty()) {
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-      Text("No shorts available", color = Color.White)
+    Box(
+      modifier = modifier.fillMaxSize().background(Color(0xFF070A11)),
+      contentAlignment = Alignment.Center
+    ) {
+      Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = LuminaCyan, modifier = Modifier.size(40.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+          text = "No publisher yet publish video",
+          style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, color = Color.White),
+          modifier = Modifier.testTag("shorts_empty_state_text")
+        )
+      }
     }
     return
   }

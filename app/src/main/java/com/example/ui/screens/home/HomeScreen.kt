@@ -90,6 +90,7 @@ fun HomeScreen(
 
   val allVideos by repository.videos.collectAsState()
   val allShorts by repository.shorts.collectAsState()
+  val isLoadingVideos by repository.isLoadingVideos.collectAsState()
   val watchHistory by repository.watchHistory.collectAsState(initial = emptyList())
 
   var selectedCategory by remember { mutableStateOf("All") }
@@ -570,30 +571,101 @@ fun HomeScreen(
         }
       }
 
-      // Main Videos Feed
-      items(filteredVideos) { video ->
-        VideoItemCard(
-          video = video,
-          onClick = { onPlayVideo(video) },
-          onChannelClick = { onOpenChannel(video.channelId) },
-          onSaveToWatchLater = {
-            repository.toggleWatchLater(video.id)
-            scope.launch { snackbarHostState.showSnackbar("Saved to Watch Later") }
-          },
-          onAddToQueue = {
-            repository.addToQueue(video)
-            scope.launch { snackbarHostState.showSnackbar("Added to Universal Queue") }
-          },
-          onShare = {
-            val sendIntent = Intent().apply {
-              action = Intent.ACTION_SEND
-              putExtra(Intent.EXTRA_TEXT, "Watch \"${video.title}\" on Lumina: ${video.videoUrl}")
-              type = "text/plain"
+      // Main Videos Feed or Empty State
+      if (isLoadingVideos && allVideos.isEmpty()) {
+        item {
+          Box(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(48.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+              CircularProgressIndicator(color = LuminaCyan, modifier = Modifier.size(36.dp))
+              Spacer(modifier = Modifier.height(12.dp))
+              Text("Loading published videos...", color = Color.Gray, fontSize = 13.sp)
             }
-            context.startActivity(Intent.createChooser(sendIntent, "Share video"))
           }
-        )
+        }
+      } else if (filteredVideos.isEmpty()) {
+        item {
+          Box(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(horizontal = 24.dp, vertical = 40.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            GlassCard(
+              modifier = Modifier.fillMaxWidth(),
+              shape = RoundedCornerShape(20.dp),
+              elevation = 4.dp
+            ) {
+              Column(
+                modifier = Modifier
+                  .fillMaxWidth()
+                  .padding(28.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                Box(
+                  modifier = Modifier
+                    .size(54.dp)
+                    .liquidGlassSurface(shape = CircleShape, elevation = 4.dp),
+                  contentAlignment = Alignment.Center
+                ) {
+                  Icon(
+                    imageVector = Icons.Default.PlayArrow,
+                    contentDescription = null,
+                    tint = LuminaCyan,
+                    modifier = Modifier.size(28.dp)
+                  )
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+                Text(
+                  text = "No publisher yet publish video",
+                  style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                  ),
+                  modifier = Modifier.testTag("empty_feed_message")
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                  text = "Be the first creator to share content! Visit Creator Studio to publish your video.",
+                  style = MaterialTheme.typography.bodySmall.copy(
+                    color = Color(0xFF94A3B8),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                  )
+                )
+              }
+            }
+          }
+        }
+      } else {
+        items(filteredVideos) { video ->
+          VideoItemCard(
+            video = video,
+            onClick = { onPlayVideo(video) },
+            onChannelClick = { onOpenChannel(video.channelId) },
+            onSaveToWatchLater = {
+              repository.toggleWatchLater(video.id)
+              scope.launch { snackbarHostState.showSnackbar("Saved to Watch Later") }
+            },
+            onAddToQueue = {
+              repository.addToQueue(video)
+              scope.launch { snackbarHostState.showSnackbar("Added to Universal Queue") }
+            },
+            onShare = {
+              val sendIntent = Intent().apply {
+                action = Intent.ACTION_SEND
+                putExtra(Intent.EXTRA_TEXT, "Watch \"${video.title}\" on Lumina: ${video.videoUrl}")
+                type = "text/plain"
+              }
+              context.startActivity(Intent.createChooser(sendIntent, "Share video"))
+            }
+          )
+        }
       }
     }
   }
 }
+

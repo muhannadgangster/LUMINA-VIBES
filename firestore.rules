@@ -1,0 +1,57 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create, update: if isOwner(userId) && request.resource.data.userId == userId;
+      allow delete: if isOwner(userId);
+    }
+
+    // Videos collection
+    match /videos/{videoId} {
+      // Publicly published videos or videos owned by current user
+      allow read: if isSignedIn() && (
+        (resource.data.status == 'published' && resource.data.visibility == 'public') ||
+        resource.data.creatorId == request.auth.uid
+      );
+      allow create: if isSignedIn() && request.resource.data.creatorId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        resource.data.creatorId == request.auth.uid ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewsCount', 'likesCount'])
+      );
+      allow delete: if isSignedIn() && resource.data.creatorId == request.auth.uid;
+
+      // Video comments subcollection
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      }
+
+      // Video likes subcollection
+      match /likes/{userId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isOwner(userId);
+      }
+    }
+
+    // User Subscriptions subcollection
+    match /users/{userId}/subscriptions/{creatorId} {
+      allow read, write: if isOwner(userId);
+    }
+  }
+}

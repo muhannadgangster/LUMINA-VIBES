@@ -1,0 +1,110 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "avatarUrl": { "type": "string" },
+        "email": { "type": "string" },
+        "subscribersCount": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["userId", "displayName", "createdAt"]
+    },
+    "Video": {
+      "title": "Video",
+      "description": "Published video metadata and statistics",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "thumbnailUrl": { "type": "string" },
+        "durationSeconds": { "type": "number" },
+        "category": { "type": "string" },
+        "creatorId": { "type": "string" },
+        "creatorName": { "type": "string" },
+        "creatorAvatar": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["published", "draft", "deleted"]
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["public", "private"]
+        },
+        "isShort": { "type": "boolean" },
+        "viewsCount": { "type": "number" },
+        "likesCount": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "title", "videoUrl", "creatorId", "status", "visibility", "createdAt"]
+    },
+    "Comment": {
+      "title": "Comment",
+      "description": "User comments on a specific video",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "videoId": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "userAvatar": { "type": "string" },
+        "text": { "type": "string" },
+        "likesCount": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "videoId", "userId", "userName", "text", "createdAt"]
+    },
+    "Like": {
+      "title": "Like",
+      "description": "User like record for a video",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "videoId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["userId", "videoId", "createdAt"]
+    },
+    "Subscription": {
+      "title": "Subscription",
+      "description": "User subscription to a channel creator",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "creatorId": { "type": "string" },
+        "creatorName": { "type": "string" },
+        "creatorAvatar": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["userId", "creatorId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/videos/{videoId}": {
+      "schema": "Video",
+      "description": "Video records and status"
+    },
+    "/videos/{videoId}/comments/{commentId}": {
+      "schema": "Comment",
+      "description": "User comments on video"
+    },
+    "/videos/{videoId}/likes/{userId}": {
+      "schema": "Like",
+      "description": "User likes on video"
+    },
+    "/users/{userId}/subscriptions/{creatorId}": {
+      "schema": "Subscription",
+      "description": "User subscriptions to channels"
+    }
+  }
+}

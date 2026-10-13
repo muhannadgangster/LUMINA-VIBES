@@ -24,8 +24,10 @@ import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MonetizationOn
 import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Upload
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -33,6 +35,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -45,6 +48,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +67,9 @@ import com.example.ui.glass.liquidGlassSurface
 import com.example.ui.theme.LuminaCyan
 import com.example.ui.theme.LuminaPink
 import com.example.ui.theme.LuminaViolet
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import kotlinx.coroutines.launch
 
 @Composable
 fun CreatorStudioScreen(
@@ -70,17 +77,29 @@ fun CreatorStudioScreen(
   onBack: () -> Unit,
   modifier: Modifier = Modifier
 ) {
-  val analytics = remember { repository.getCreatorAnalytics() }
+  val scope = rememberCoroutineScope()
+  val user = Firebase.auth.currentUser
   val allVideos by repository.videos.collectAsState()
 
-  val myUploads = allVideos.filter { it.channelId == "user_channel" || it.id.startsWith("custom_") }
+  val myUploads = remember(allVideos, user) {
+    if (user != null) {
+      allVideos.filter { it.creatorId == user.uid || it.channelId == user.uid }
+    } else {
+      emptyList()
+    }
+  }
+
+  val analytics = remember(myUploads) { repository.getCreatorAnalytics() }
 
   var showUploadDialog by remember { mutableStateOf(false) }
   var uploadTitle by remember { mutableStateOf("") }
   var uploadDesc by remember { mutableStateOf("") }
   var uploadCategory by remember { mutableStateOf("Tech & Design") }
   var uploadUrl by remember { mutableStateOf("") }
+  var uploadThumbnailUrl by remember { mutableStateOf("") }
   var uploadIsShort by remember { mutableStateOf(false) }
+  var isPublishing by remember { mutableStateOf(false) }
+  var uploadErrorMessage by remember { mutableStateOf<String?>(null) }
 
   Column(
     modifier = modifier
@@ -114,7 +133,10 @@ fun CreatorStudioScreen(
             Brush.horizontalGradient(listOf(LuminaCyan, LuminaViolet)),
             RoundedCornerShape(16.dp)
           )
-          .clickable { showUploadDialog = true }
+          .clickable {
+            uploadErrorMessage = null
+            showUploadDialog = true
+          }
           .padding(horizontal = 12.dp, vertical = 8.dp)
           .testTag("upload_video_btn"),
         contentAlignment = Alignment.Center
@@ -122,7 +144,7 @@ fun CreatorStudioScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
           Icon(Icons.Default.Upload, contentDescription = null, tint = Color(0xFF070A11), modifier = Modifier.size(16.dp))
           Spacer(modifier = Modifier.width(4.dp))
-          Text("Upload", color = Color(0xFF070A11), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+          Text("Upload Video", color = Color(0xFF070A11), fontWeight = FontWeight.Bold, fontSize = 12.sp)
         }
       }
     }
@@ -131,10 +153,10 @@ fun CreatorStudioScreen(
       modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
       contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 90.dp)
     ) {
-      // Channel Performance Overview Cards
+      // Channel Performance Overview Cards (Calculated directly from real database metrics)
       item {
         Text(
-          text = "Channel Performance (Last 28 Days)",
+          text = "Real-Time Channel Analytics",
           style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold, color = Color.White),
           modifier = Modifier.padding(vertical = 8.dp)
         )
@@ -146,9 +168,9 @@ fun CreatorStudioScreen(
           horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
           StatCard(
-            title = "Views",
-            value = "184.5K",
-            subtext = "↑ +14.2%",
+            title = "Total Views",
+            value = "${analytics.totalViews}",
+            subtext = "Genuine views",
             icon = Icons.Default.Visibility,
             iconTint = LuminaCyan,
             modifier = Modifier.weight(1f)
@@ -156,8 +178,8 @@ fun CreatorStudioScreen(
 
           StatCard(
             title = "Watch Time",
-            value = "12.4K hrs",
-            subtext = "↑ +8.7%",
+            value = "${analytics.totalWatchHours} hrs",
+            subtext = "Total playback",
             icon = Icons.Default.Timer,
             iconTint = LuminaViolet,
             modifier = Modifier.weight(1f)
@@ -172,18 +194,18 @@ fun CreatorStudioScreen(
         ) {
           StatCard(
             title = "Subscribers",
-            value = "4,820",
-            subtext = "↑ +420 this month",
+            value = "${analytics.subscribersCount}",
+            subtext = "Active followers",
             icon = Icons.Default.People,
             iconTint = LuminaPink,
             modifier = Modifier.weight(1f)
           )
 
           StatCard(
-            title = "Est. Revenue",
-            value = "$1,420.75",
-            subtext = "RPM: $7.70",
-            icon = Icons.Default.MonetizationOn,
+            title = "Published Content",
+            value = "${myUploads.size}",
+            subtext = "Videos in cloud",
+            icon = Icons.Default.VideoLibrary,
             iconTint = Color(0xFF4ADE80),
             modifier = Modifier.weight(1f)
           )
@@ -213,7 +235,7 @@ fun CreatorStudioScreen(
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
               Text("No published videos yet.", color = Color.Gray)
               Spacer(modifier = Modifier.height(8.dp))
-              Text("Click 'Upload' to publish your first video or short!", color = LuminaCyan, fontSize = 12.sp)
+              Text("Click 'Upload Video' above to publish to Firebase!", color = LuminaCyan, fontSize = 12.sp)
             }
           }
         }
@@ -229,7 +251,7 @@ fun CreatorStudioScreen(
               verticalAlignment = Alignment.CenterVertically
             ) {
               AsyncImage(
-                model = video.thumbnailUrl,
+                model = video.thumbnailUrl.ifBlank { "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&auto=format&fit=crop&q=80" },
                 contentDescription = null,
                 modifier = Modifier.size(64.dp, 40.dp).clip(RoundedCornerShape(6.dp)),
                 contentScale = ContentScale.Crop
@@ -240,11 +262,11 @@ fun CreatorStudioScreen(
               Column(modifier = Modifier.weight(1f)) {
                 Text(
                   text = video.title,
-                  style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                  style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold, color = Color.White),
                   maxLines = 1
                 )
                 Text(
-                  text = "${video.category} • ${if (video.isShort) "⚡ Short" else "Standard"} • ${video.views} views",
+                  text = "${video.category} • ${if (video.isShort) "⚡ Short" else "Standard"} • ${video.views} views • ${video.likesCount} likes",
                   style = MaterialTheme.typography.labelSmall.copy(color = Color.Gray)
                 )
               }
@@ -255,18 +277,31 @@ fun CreatorStudioScreen(
     }
   }
 
-  // UPLOAD VIDEO DIALOG
+  // Real Upload Dialog to Firebase Firestore
   if (showUploadDialog) {
     AlertDialog(
-      onDismissRequest = { showUploadDialog = false },
-      title = { Text("Publish Video to Lumina", color = Color.White, fontWeight = FontWeight.Bold) },
+      onDismissRequest = {
+        if (!isPublishing) showUploadDialog = false
+      },
+      title = {
+        Text("Publish Video to Lumina", color = Color.White, fontWeight = FontWeight.Bold)
+      },
       text = {
-        Column {
+        Column(modifier = Modifier.fillMaxWidth()) {
+          if (uploadErrorMessage != null) {
+            Text(
+              text = uploadErrorMessage ?: "",
+              color = Color(0xFFF87171),
+              fontSize = 12.sp,
+              modifier = Modifier.padding(bottom = 8.dp)
+            )
+          }
+
           OutlinedTextField(
             value = uploadTitle,
             onValueChange = { uploadTitle = it },
-            label = { Text("Video Title") },
-            placeholder = { Text("e.g. Next-Gen Liquid Glass Architecture") },
+            label = { Text("Title *") },
+            placeholder = { Text("E.g., Quantum Computing Explained") },
             modifier = Modifier.fillMaxWidth().testTag("upload_input_title"),
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = LuminaCyan)
           )
@@ -277,7 +312,7 @@ fun CreatorStudioScreen(
             value = uploadDesc,
             onValueChange = { uploadDesc = it },
             label = { Text("Description") },
-            placeholder = { Text("Describe the video content and tags...") },
+            placeholder = { Text("Brief overview of the video...") },
             modifier = Modifier.fillMaxWidth().testTag("upload_input_desc"),
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = LuminaCyan)
           )
@@ -297,9 +332,20 @@ fun CreatorStudioScreen(
           OutlinedTextField(
             value = uploadUrl,
             onValueChange = { uploadUrl = it },
-            label = { Text("Video URL (optional)") },
-            placeholder = { Text("Defaults to high-speed open stream") },
+            label = { Text("Video Stream URL (MP4 / HLS) *") },
+            placeholder = { Text("https://.../video.mp4") },
             modifier = Modifier.fillMaxWidth().testTag("upload_input_url"),
+            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = LuminaCyan)
+          )
+
+          Spacer(modifier = Modifier.height(8.dp))
+
+          OutlinedTextField(
+            value = uploadThumbnailUrl,
+            onValueChange = { uploadThumbnailUrl = it },
+            label = { Text("Thumbnail Image URL (optional)") },
+            placeholder = { Text("https://.../cover.jpg") },
+            modifier = Modifier.fillMaxWidth().testTag("upload_input_thumb"),
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = LuminaCyan)
           )
 
@@ -312,34 +358,60 @@ fun CreatorStudioScreen(
               modifier = Modifier.testTag("upload_check_is_short")
             )
             Spacer(modifier = Modifier.width(4.dp))
-            Text("Publish as a Lumina Short (Vertical Video)", color = Color.White, fontSize = 12.sp)
+            Text("Publish as a Lumina Short (Vertical)", color = Color.White, fontSize = 12.sp)
           }
         }
       },
       confirmButton = {
         Button(
           onClick = {
-            if (uploadTitle.isNotBlank()) {
-              repository.publishVideo(
+            if (uploadTitle.isBlank()) {
+              uploadErrorMessage = "Title is required."
+              return@Button
+            }
+            if (uploadUrl.isBlank()) {
+              uploadErrorMessage = "Video stream URL is required."
+              return@Button
+            }
+            isPublishing = true
+            uploadErrorMessage = null
+            scope.launch {
+              val res = repository.publishVideo(
                 title = uploadTitle,
                 description = uploadDesc,
                 category = uploadCategory,
                 videoUrl = uploadUrl,
+                thumbnailUrl = uploadThumbnailUrl.ifBlank { "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&auto=format&fit=crop&q=80" },
                 isShort = uploadIsShort
               )
-              showUploadDialog = false
-              uploadTitle = ""
-              uploadDesc = ""
+              isPublishing = false
+              if (res.isSuccess) {
+                showUploadDialog = false
+                uploadTitle = ""
+                uploadDesc = ""
+                uploadUrl = ""
+                uploadThumbnailUrl = ""
+              } else {
+                uploadErrorMessage = res.exceptionOrNull()?.localizedMessage ?: "Failed to publish video"
+              }
             }
           },
           colors = ButtonDefaults.buttonColors(containerColor = LuminaCyan),
-          modifier = Modifier.testTag("upload_submit_btn")
+          modifier = Modifier.testTag("upload_submit_btn"),
+          enabled = !isPublishing
         ) {
-          Text("Publish", color = Color(0xFF070A11), fontWeight = FontWeight.Bold)
+          if (isPublishing) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color(0xFF070A11))
+          } else {
+            Text("Publish", color = Color(0xFF070A11), fontWeight = FontWeight.Bold)
+          }
         }
       },
       dismissButton = {
-        TextButton(onClick = { showUploadDialog = false }) {
+        TextButton(
+          onClick = { showUploadDialog = false },
+          enabled = !isPublishing
+        ) {
           Text("Cancel", color = Color.Gray)
         }
       },

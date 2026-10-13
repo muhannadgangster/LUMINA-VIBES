@@ -1,12 +1,8 @@
 package com.example.player
 
-import android.app.Activity
-import android.app.PictureInPictureParams
 import android.content.Context
 import android.net.Uri
-import android.os.Build
 import android.util.Log
-import android.util.Rational
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -48,17 +44,17 @@ data class PlaybackState(
 
 class VideoPlayerManager(
   private val context: Context,
-  private val onRecordHistory: (videoId: String, positionMs: Long, durationMs: Long) -> Unit
+  private val onRecordHistory: (videoId: String, positionMs: Long, durationMs: Long) -> Unit,
+  private val onVideoStarted: ((videoId: String) -> Unit)? = null
 ) {
   companion object {
     private const val TAG = "VideoPlayerManager"
-    const val DEFAULT_FALLBACK_URL = "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"
-    const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Lumina/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    const val USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
   }
 
   private val scope = CoroutineScope(Dispatchers.Main)
   private var progressTrackerJob: Job? = null
-  private var hasAttemptedFallback = false
+  private var recordedViewForCurrentVideo = false
 
   private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
     .setUserAgent(USER_AGENT)
@@ -84,6 +80,12 @@ class VideoPlayerManager(
     exoPlayer.addListener(object : Player.Listener {
       override fun onIsPlayingChanged(isPlaying: Boolean) {
         _state.value = _state.value.copy(isPlaying = isPlaying)
+        if (isPlaying && !recordedViewForCurrentVideo) {
+          recordedViewForCurrentVideo = true
+          _state.value.currentVideo?.let { v ->
+            onVideoStarted?.invoke(v.id)
+          }
+        }
       }
 
       override fun onPlaybackStateChanged(playbackState: Int) {
@@ -111,26 +113,16 @@ class VideoPlayerManager(
       }
 
       override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-        Log.e(TAG, "ExoPlayer Error encountered: ${error.errorCodeName} - ${error.message}", error)
-        
-        // Auto-recover if the specific remote CDN source failed (e.g. 403 or network drop)
-        if (!hasAttemptedFallback) {
-          hasAttemptedFallback = true
-          Log.i(TAG, "Switching to reliable high-speed fallback stream: $DEFAULT_FALLBACK_URL")
-          try {
-            val fallbackItem = MediaItem.fromUri(Uri.parse(DEFAULT_FALLBACK_URL))
-            exoPlayer.setMediaItem(fallbackItem)
-            exoPlayer.prepare()
-            exoPlayer.play()
-            return
-          } catch (e: Exception) {
-            Log.e(TAG, "Fallback attempt failed", e)
-          }
+        Log.e(TAG, "ExoPlayer playback error: ${error.errorCodeName} - ${error.message}", error)
+        val userFriendlyMessage = when {
+          error.message?.contains("403") == true -> "Access forbidden (HTTP 403). The video stream URL may require authorization or is no longer accessible."
+          error.message?.contains("404") == true -> "Video source not found (HTTP 404)."
+          else -> error.localizedMessage ?: "Failed to stream video. Please check connection and retry."
         }
-
         _state.value = _state.value.copy(
           isBuffering = false,
-          errorMessage = "Playback error: ${error.localizedMessage ?: "Source unavailable"}"
+          isPlaying = false,
+          errorMessage = userFriendlyMessage
         )
       }
     })
@@ -139,8 +131,8 @@ class VideoPlayerManager(
   }
 
   fun playVideo(video: Video, startPositionMs: Long = 0L, expandToPlayer: Boolean = true) {
-    hasAttemptedFallback = false
-    if (_state.value.currentVideo?.id == video.id && exoPlayer.playbackState == Player.STATE_READY) {
+    recordedViewForCurrentVideo = false
+    if (_state.value.currentVideo?.id == video.id && exoPlayer.playbackState == Player.STATE_READY && _state.value.errorMessage == null) {
       if (expandToPlayer && _state.value.displayMode == PlayerDisplayMode.COLLAPSED) {
         _state.value = _state.value.copy(displayMode = PlayerDisplayMode.EXPANDED)
       }
@@ -148,7 +140,6 @@ class VideoPlayerManager(
       return
     }
 
-    // Save previous video history before switching
     saveCurrentHistory()
 
     _state.value = _state.value.copy(
@@ -161,6 +152,10 @@ class VideoPlayerManager(
     )
 
     try {
+      if (video.videoUrl.isBlank()) {
+        _state.value = _state.value.copy(errorMessage = "Video stream URL is empty")
+        return
+      }
       val mediaItem = MediaItem.fromUri(Uri.parse(video.videoUrl))
       exoPlayer.setMediaItem(mediaItem)
       exoPlayer.prepare()
@@ -169,6 +164,7 @@ class VideoPlayerManager(
       }
       exoPlayer.play()
     } catch (e: Exception) {
+      Log.e(TAG, "Error initializing playback", e)
       _state.value = _state.value.copy(errorMessage = "Could not initialize video: ${e.message}")
     }
   }
@@ -178,45 +174,48 @@ class VideoPlayerManager(
     playVideo(current, _state.value.currentPositionMs, expandToPlayer = true)
   }
 
-  fun setQueue(videos: List<Video>) {
+  fun setPlaylist(videos: List<Video>) {
     _playlist.value = videos
   }
 
   fun playNextInQueue() {
-    val q = _playlist.value
-    val current = _state.value.currentVideo
-    if (q.isNotEmpty()) {
-      val currentIndex = q.indexOfFirst { it.id == current?.id }
-      if (currentIndex in 0 until q.lastIndex) {
-        playVideo(q[currentIndex + 1], expandToPlayer = false)
-      }
+    val list = _playlist.value
+    if (list.isEmpty()) return
+    val currentIndex = list.indexOfFirst { it.id == _state.value.currentVideo?.id }
+    val nextIndex = if (currentIndex != -1 && currentIndex + 1 < list.size) currentIndex + 1 else -1
+    if (nextIndex != -1) {
+      playVideo(list[nextIndex], expandToPlayer = false)
     }
   }
 
   fun playPreviousInQueue() {
-    val q = _playlist.value
-    val current = _state.value.currentVideo
-    if (q.isNotEmpty()) {
-      val currentIndex = q.indexOfFirst { it.id == current?.id }
-      if (currentIndex > 0) {
-        playVideo(q[currentIndex - 1], expandToPlayer = false)
-      }
+    val list = _playlist.value
+    if (list.isEmpty()) return
+    val currentIndex = list.indexOfFirst { it.id == _state.value.currentVideo?.id }
+    val prevIndex = if (currentIndex > 0) currentIndex - 1 else -1
+    if (prevIndex != -1) {
+      playVideo(list[prevIndex], expandToPlayer = false)
+    }
+  }
+
+  fun togglePlayPause() {
+    if (exoPlayer.isPlaying) {
+      pause()
+    } else {
+      play()
     }
   }
 
   fun play() {
-    exoPlayer.play()
-    _state.value = _state.value.copy(isPlaying = true)
+    if (_state.value.errorMessage != null) {
+      retry()
+    } else {
+      exoPlayer.play()
+    }
   }
 
   fun pause() {
     exoPlayer.pause()
-    _state.value = _state.value.copy(isPlaying = false)
-    saveCurrentHistory()
-  }
-
-  fun togglePlayPause() {
-    if (exoPlayer.isPlaying) pause() else play()
   }
 
   fun seekTo(positionMs: Long) {
@@ -239,44 +238,29 @@ class VideoPlayerManager(
     _state.value = _state.value.copy(playbackSpeed = speed)
   }
 
-  fun setQuality(quality: String) {
-    _state.value = _state.value.copy(selectedQuality = quality)
+  fun toggleMute() {
+    val shouldMute = !_state.value.isMuted
+    exoPlayer.volume = if (shouldMute) 0.0f else 1.0f
+    _state.value = _state.value.copy(isMuted = shouldMute)
   }
 
   fun setDisplayMode(mode: PlayerDisplayMode) {
     _state.value = _state.value.copy(displayMode = mode)
   }
 
+  fun collapsePlayer() {
+    _state.value = _state.value.copy(displayMode = PlayerDisplayMode.COLLAPSED)
+  }
+
+  fun expandPlayer() {
+    _state.value = _state.value.copy(displayMode = PlayerDisplayMode.EXPANDED)
+  }
+
   fun closePlayer() {
-    pause()
     saveCurrentHistory()
-    _state.value = _state.value.copy(
-      currentVideo = null,
-      displayMode = PlayerDisplayMode.COLLAPSED
-    )
-  }
-
-  fun toggleMute() {
-    val newMuted = !_state.value.isMuted
-    exoPlayer.volume = if (newMuted) 0f else 1f
-    _state.value = _state.value.copy(isMuted = newMuted)
-  }
-
-  fun enterPictureInPicture(activity: Activity): Boolean {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val params = PictureInPictureParams.Builder()
-        .setAspectRatio(Rational(16, 9))
-        .build()
-      return activity.enterPictureInPictureMode(params)
-    }
-    return false
-  }
-
-  private fun saveCurrentHistory() {
-    val video = _state.value.currentVideo ?: return
-    val pos = exoPlayer.currentPosition.coerceAtLeast(0L)
-    val dur = exoPlayer.duration.coerceAtLeast(1000L)
-    onRecordHistory(video.id, pos, dur)
+    exoPlayer.stop()
+    exoPlayer.clearMediaItems()
+    _state.value = PlaybackState(displayMode = PlayerDisplayMode.COLLAPSED)
   }
 
   private fun startProgressTracker() {
@@ -284,20 +268,32 @@ class VideoPlayerManager(
     progressTrackerJob = scope.launch {
       while (isActive) {
         if (exoPlayer.isPlaying) {
+          val pos = exoPlayer.currentPosition
+          val buffered = exoPlayer.bufferedPosition
+          val dur = exoPlayer.duration.coerceAtLeast(0L)
           _state.value = _state.value.copy(
-            currentPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L),
-            durationMs = exoPlayer.duration.coerceAtLeast(0L),
-            bufferedPositionMs = exoPlayer.bufferedPosition.coerceAtLeast(0L)
+            currentPositionMs = pos,
+            bufferedPositionMs = buffered,
+            durationMs = dur
           )
         }
-        delay(300)
+        delay(350L)
       }
     }
   }
 
+  private fun saveCurrentHistory() {
+    val cur = _state.value.currentVideo ?: return
+    val pos = exoPlayer.currentPosition
+    val dur = exoPlayer.duration.coerceAtLeast(0L)
+    if (dur > 0 && pos > 1000L) {
+      onRecordHistory(cur.id, pos, dur)
+    }
+  }
+
   fun release() {
-    progressTrackerJob?.cancel()
     saveCurrentHistory()
+    progressTrackerJob?.cancel()
     exoPlayer.release()
   }
 }
