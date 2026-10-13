@@ -1,0 +1,6 @@
+{
+  "name": "Lumina",
+  "description": "Next-generation video streaming and social platform featuring Liquid Glass design, immersive shorts, and creator studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
